@@ -6,7 +6,7 @@ classdef AutoId < handle
     properties(Constant)
         % constants
         ncandidates         = 7;
-        annotation_weight   = 0.5;
+        annotation_weight   = 1e1;
         
         iter_sinkhorn       = 500;
         iter_rwc            = 10;
@@ -106,7 +106,9 @@ classdef AutoId < handle
             vec_x = x(:);
         end
         
-        function beta = MCR_solver(Y,X,sigma)
+
+        
+        function beta = MCR_solver(Y,X,sigma,lambda)
             % MCR - Multiple covariance regression solver
             % Y - Target (n x d)
             % X - Source (n x p)
@@ -127,6 +129,10 @@ classdef AutoId < handle
                 A(:,:,i) = kron(inv(sigma(:,:,i)),X(i,:)'*X(i,:));
                 B(:,:,i) = X(i,:)'*Y(i,:)/sigma(:,:,i);
             end
+            
+            A(:,:,end+1)=lambda.*eye(size(A,1),size(A,2));
+            B(:,:,end+1)=[lambda*eye(size(B,1)-1,size(B,2));zeros(1,size(B,2))];
+            
             beta = reshape(nansum(A,3)\Methods.AutoId.vec(nansum(B,3)),[size(X,2),size(Y,2)]);
         end
         
@@ -235,6 +241,12 @@ classdef AutoId < handle
                 [P,cost,~] = Methods.munkres_extended(log_likelihoodhat, Methods.AutoId.p_fp, Methods.AutoId.max_fp);
                 P = double(P); P(:,~any(P)) = NaN;
                 varargout{1} = cost;
+                
+                Q = P;
+                for i=1:size(known,1)
+                    Q(known(i,1),known(i,2)) = NaN;
+                end
+                varargout{1} = nansum(Q(:).*log_likelihoodhat(:));
             else
                 P = Methods.munkres_extended(log_likelihoodhat, Methods.AutoId.p_fp, Methods.AutoId.max_fp);
                 P = double(P); P(:,~any(P)) = NaN;
@@ -252,7 +264,7 @@ classdef AutoId < handle
 %             gm = gmdistribution(model.mu,model.sigma);
             
             % standardize positions by axis aligning it
-            pos = AutoId.major_axis_align(pos,sgn);
+            pos = AutoId.major_axis_align(POS,sgn);
             
             % compute the rough transformation between atlas centers and
             % its axis-aligned version 
@@ -275,33 +287,32 @@ classdef AutoId < handle
             
             for iteration = 1: AutoId.iter_rwc
                 % sample from GMM components
-                Z = arrayfun(@(i) mvnrnd(model.mu(i,:), model.sigma(:,:,i)), 1:size(model.mu,1), 'UniformOutput', false);
-                Z = vertcat(Z{:});
+%                 Z = arrayfun(@(i) mvnrnd(model.mu(i,:), model.sigma(:,:,i)), 1:size(model.mu,1), 'UniformOutput', false);
+%                 Z = vertcat(Z{:});
                 
                 % update permutation
                 P = AutoId.update_permutation(col,pos,model,annotated);
                 
                 % align point to sample
-                beta_pos = AutoId.MCR_solver(model.mu(:,1:3), P'*[pos ones(size(pos,1),1)], sigma_weighted(1:3,1:3,:));
-                beta_col = AutoId.MCR_solver(model.mu(:,4:end), P'*[col ones(size(col,1),1)], sigma_weighted(4:end,4:end,:));
-
-                beta = AutoId.MCR_solver([pos(:,[1 2 3]) ones(size(pos,1),1)]*beta_pos,[POS ones(size(pos,1),1)],repmat(eye(3),1,1,size(pos,1)));
+                beta_pos = AutoId.MCR_solver(model.mu(:,1:3), P'*[pos ones(size(pos,1),1)], sigma_weighted(1:3,1:3,:),0);
+                beta_col = AutoId.MCR_solver(model.mu(:,4:end), P'*[col ones(size(col,1),1)], sigma_weighted(4:end,4:end,:),1e5);
                 
                 % making sure that there are no mirror flips
-                det_cost = sign(det(beta(1:3,1:3)));
-                beta_pos = beta_pos*det_cost;
+                det_cost = sign(det(beta_pos(1:3,1:3)));
+                if det_cost < 0
+                    cost = Inf;
+                    return
+                end
+%                 beta_pos(1:3,1:3) = beta_pos(1:3,1:3)*det_cost;
                 
                 % update positions and colors
                 pos = [pos ones(size(pos,1),1)]*beta_pos;
                 col = [col ones(size(col,1),1)]*beta_col;
             end
             
-            % compute the cost based on log likelihood of current local
-            % alignment and GMM distribution
-%             cost = nansum(-log(gm.pdf([pos col])));
-
 %             % compute the cost based on Hungarian
             [~,cost] = AutoId.update_permutation(col,pos,model,annotated);
+            
         end
         
     end
@@ -433,7 +444,8 @@ classdef AutoId < handle
             aligned = obj.global_alignment(file, colors, im.get_positions().*im.scale, ...
                                obj.atlas.(lower(im.bodypart)).model, annotated);
             
-            
+                           
+                        
             for neuron=1:length(im.neurons)
                 im.neurons(neuron).aligned_xyzRGB = aligned(neuron,:);
             end
@@ -507,11 +519,11 @@ classdef AutoId < handle
             
             % Do we have the parallelization toolbox?
             is_parallel = true;
-            parallel_tb = ver('parallel');
+            parallel_tb = ver('distcomp');
             if isempty(parallel_tb)
                 is_parallel = false;
             end
-            
+                                    
             % Setup the progress bar.
             % Note: windows wants the interpreter off from the beginning.
             wait_title = 'ID''ing Neurons';
@@ -528,6 +540,8 @@ classdef AutoId < handle
             if is_parallel
                 %pool = gcp(); % may want to have a ready-use pool
             end
+            
+%             is_parallel = false;
             
             % Compute the alignment.
             num_tests = 2*length(AutoId.theta);
@@ -681,6 +695,7 @@ classdef AutoId < handle
                 return;
             end
             
+            
             % reduce rank to match aligned
             % CHECKING ALIGNED HERE, WE'RE GOOD!!!
             if size(aligned,1) < size(col,1)
@@ -691,14 +706,17 @@ classdef AutoId < handle
             end
             
             % find transformation between original and aligned data
-            beta = linsolve([aligned ones(size(pos,1),1)],[pos col ones(size(pos,1),1)]);
+            beta_pos = linsolve([aligned(:,1:3) ones(size(pos,1),1)],[pos ones(size(pos,1),1)]);
+            beta_col = linsolve([aligned(:,4:end) ones(size(pos,1),1)],[col ones(size(pos,1),1)]);
             
             % move atlas based on the transformation
-            model.mu = [model.mu ones(size(model.mu,1),1)]*beta;
+            model.mu(:,1:3) = [model.mu(:,1:3) ones(size(model.mu,1),1)]*beta_pos(:,1:3);
+            model.mu(:,4:end) = [model.mu(:,4:end) ones(size(model.mu,1),1)]*beta_col(:,1:end-1);
             for i=1:size(model.sigma,3)
-                model.sigma([1 2 3],[1 2 3],i) = beta([1 2 3],[1 2 3])'*model.sigma([1 2 3],[1 2 3],i)* beta([1 2 3],[1 2 3]);
+                model.sigma([1 2 3],[1 2 3],i) = beta_pos(1:3,1:3)'*model.sigma([1 2 3],[1 2 3],i)* beta_pos(1:3,1:3);
             end
             
+                        
             % plot the result
             atlas_color = model.mu(:, [4 5 6]); atlas_color = (atlas_color)./(max(atlas_color));
 
